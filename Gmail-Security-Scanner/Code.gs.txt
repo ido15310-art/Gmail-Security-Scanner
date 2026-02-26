@@ -1,0 +1,185 @@
+/**
+ * פונקציית הכניסה הראשית - אשר אוספת את נתוני המייל והמשתמש מהענן, ומנהלת את סדר הפעולות עד להצגת התוצאה הסופית על המסך
+ */
+function buildAddOn(e) 
+{
+  var accessToken = e.gmail.accessToken;
+  GmailApp.setCurrentMessageAccessToken(accessToken); // קבלת מפתח גישה זמני לקריאת המייל בצורה מאובטחת
+  var messageId = e.gmail.messageId;
+  var message = GmailApp.getMessageById(messageId);// שליפת המייל המלא מהשרת של גוגל לפי ה-ID שלו
+  var senderRaw = message.getFrom();
+  var sender = senderRaw.replace(/^.*<(.+)>.*$/, '$1');// שמירת כתובת השולח
+  var props = PropertiesService.getUserProperties();// פתיחת מקום בענן לשליפת נתונים
+  var blacklistStr = props.getProperty('blacklist') || "";
+  var isBlacklisted = blacklistStr.split(",").indexOf(sender) !== -1;// בדיקה האם השולח כבר נמצא ברשימה השחורה שלנו
+  var analysis = analyzeEmail(message, isBlacklisted);  // ניתוח המייל ע"פ הקרטריונים
+  var isRepeatOffender = props.getProperty("flagged_" + sender) === "true";// בודק האם השולח כבר שלח פעם הודעה
+  if (analysis.score >= 40) // אם השולח ששלח פעם הודעה קיבל ציון מעל 40 יקפיץ אזהרה למשתמש
+  {
+    props.setProperty("flagged_" + sender, "true");
+  }
+  return createUI(analysis, sender, isBlacklisted, isRepeatOffender);  //  בניית הממשק והעברת כל הנתונים 
+
+}
+
+/**
+ * סורק אימייל לאיתור פישינג על ידי ניתוח מילות מפתח, קישורים לא מאובטחים (HTTP) וקבצים מצורפים מסוכנים.
+ */
+function analyzeEmail(message, isBlacklisted) {
+  var score = 0;
+  var reasons = [];// אתחול משתנים, ציון מתחיל מ-0 וסיבות ריקה
+  if (isBlacklisted)// בדיקה האם השולח כבר נמצא ברשימה השחורה, אם כן אין טעם להמשיך בדיקה הציון שלו יהיה 100
+  {
+    return { score: 100, verdict: "Blocked by you 🚫", explanation: "Sender is in your blacklist" };
+  }
+  var subject = (message.getSubject() || "").toLowerCase();
+  var body = (message.getPlainBody() || "").toLowerCase();
+  var fullText = subject + " " + body;// אתחול משתנים שמכילים את הנושא ואת התוכן והעברתם למשתנה אחד כדי לצמצם בדיקות
+  var urgencyWords = ["urgent","action required", "immediately", "expired", "דחוף", "פעולה נדרשת","מיידי", "פג תוקף"];
+  var rewardWords = ["winner", "lottery", "gift card", "free", "פרס", "מתנה","זכית","הגרלה","כרטיס מתנה", "חינם"];
+  var financeWords = ["bank", "paypal", "invoice", "payment", "crypto","בנק","חשבונית", "תשלום","קריפטו"];
+  // מערכי מילים מחשידות בנושאי דחיפות פרסים ופיננסים (ניתן להגדיל את מערכי המילים ולייצר יותר אפשרויות לצבירת הניקוד)
+  urgencyWords.forEach(function(word)// לולאה שמזהה מילים המפעילות לחץ ויוצרות תחושת דחיפות
+  {
+    if (fullText.includes(word))
+    { 
+      score += 25; 
+      reasons.push("High urgency detected (" + word + ")"); 
+    }
+  });
+  rewardWords.forEach(function(word)// לולאה שמזהה ניסיונות פיתוי באמצעות הבטחת פרסים או מתנות
+  {
+    if (fullText.includes(word)) 
+    {
+       score += 25;
+       reasons.push("Potential bait/reward detected (" + word + ")"); 
+    }
+  });
+  financeWords.forEach(function(word)// לולאה שסורקת מילים הקשורות לכסף וחשבונות בנק רגישים
+  {
+    if (fullText.includes(word)) 
+    { 
+      score += 15;
+      reasons.push("Sensitive financial topic (" + word + ")"); 
+    }
+  });
+  if (body.includes("http://")) //  בדיקה האם יש קישורים חשודים כלא מאובטחים בגוף המייל
+  {
+    score += 40;
+    reasons.push("Insecure link detected (HTTP)");
+  } 
+  var attachments = message.getAttachments(); // שולף את רשימת הקבצים המצורפים
+  attachments.forEach(function(attachment) // לולאה שרצה על מערך הקבצים המצורפים
+  {
+    var fileName = attachment.getName().toLowerCase(); // לוקח את שם הקובץ
+    if (fileName.endsWith(".exe") || fileName.endsWith(".zip")) {
+      score += 50;
+      reasons.push("Dangerous file attached: " + fileName);
+    }
+  });
+  var uniqueReasons = reasons.filter(function(item, pos) // ניקוי כפילויות בהסברים
+  { 
+    return reasons.indexOf(item) == pos; 
+  });
+  score = Math.min(score, 100);// נרמול הציון
+  var verdict = score >= 70 ? "Highly Dangerous ❌" : (score >= 40 ? "Suspicious ⚠️" : "Safe ✅");// פסק הדין
+  return {
+    score: score,
+    verdict: verdict,
+    explanation: uniqueReasons.length > 0 ? uniqueReasons.join(", ") : "No threats detected"};
+}
+
+/**
+ * בניית הממשק המוצג למשתמש
+ */
+function createUI(analysis, sender, isBlacklisted, isRepeatOffender) {
+  var card = CardService.newCardBuilder();// הכנת דף התצוגה
+  card.setHeader(CardService.newCardHeader().setTitle("Upwind Scanner"));// כותרת
+  var section = CardService.newCardSection();
+  
+  // שימוש בתגיות <b> להדגשה בתוך הממשק
+  section.addWidget(CardService.newTextParagraph().setText("<b>Score:</b> " + analysis.score + "/100"));  // הצגת ניקוד הסיכון
+  section.addWidget(CardService.newTextParagraph().setText("<b>Status:</b> " + analysis.verdict));// הצגת פסק דין הסופי
+  section.addWidget(CardService.newTextParagraph().setText("<b>Analysis:</b> " + analysis.explanation));// הצגת רשימת הסכונים שזוהו 
+  
+  if (isRepeatOffender) // הצגת אזהרת היסטוריה
+  {
+    section.addWidget(CardService.newTextParagraph().setText("⚠️ <b>Note:</b> This sender was flagged in previous scans."));
+  }
+  
+  var action = CardService.newAction().setFunctionName(isBlacklisted ? 'removeFromBlacklist' : 'addToBlacklist').setParameters({sender: sender});   // בדיקה האם השולח נמצא כבר ברשימה השחורה
+  section.addWidget(CardService.newTextButton().setText(isBlacklisted ? "✅ Mark as Safe" : "🚫 Block Sender").setOnClickAction(action));// יצירת כפתור חסימה או שחרור - הטקסט משתנה לפי מצב השולח (חסום או לא)
+  section.addWidget(CardService.newTextButton().setText("📜 View Blacklist").setOnClickAction(CardService.newAction().setFunctionName('showFullBlacklist')));// יצירת כפתור לפתיחת הרשימה השחורה המלאה של המשתמש
+  
+  card.addSection(section); // הוספת התוכן לדף התוסף
+  return card.build();
+}
+
+/**
+ * פונקצית הוספה לרשימה השחורה
+ */
+function addToBlacklist(e) {
+  var sender = e.parameters.sender;
+  var props = PropertiesService.getUserProperties();
+  var blacklist = props.getProperty('blacklist') || "";
+  if (blacklist.indexOf(sender) === -1) {
+    props.setProperty('blacklist', blacklist + (blacklist ? "," : "") + sender);
+  }
+  
+  var notification = CardService.newNotification().setText("Sender blocked successfully");// הודעה קופצת
+  var navigation = CardService.newNavigation().updateCard(buildAddOn(e)); // בונה את הכרטיס מחדש
+  
+  var response = CardService.newActionResponseBuilder();// יצירת אובייקט תגובה שיישלח בחזרה לג'ימייל
+  response.setNotification(notification); // הוספת הודעת אישור קופצת
+  response.setNavigation(navigation);// הוראה לממשק להתרענן ולהציג את הכרטיס המעודכן (למשל, שינוי הכפתור מ'חסימה' ל'שחרור')
+  
+  return response.build();// החזרת התשובה
+}
+
+/**
+ * פונקצית הסרה מהרשימה השחורה
+ */
+function removeFromBlacklist(e) {
+  var sender = e.parameters.sender;
+  var props = PropertiesService.getUserProperties();
+  var list = (props.getProperty('blacklist') || "").split(",");
+  var newList = list.filter(function(item)// יצירת רשימה חדשה שאינה כוללת את השולח הנוכחי
+  { 
+    return item !== sender; 
+  });
+  props.setProperty('blacklist', newList.join(","));// שמירת הרשימה המעודכנת לאחר שהפכנו אותה שוב למחרוזת עם פסיקים
+  
+  var notification = CardService.newNotification().setText("Sender marked as safe"); // יצירת ההודעה הקופצת (Notification) שתאשר למשתמש שהפעולה הצליחה
+  var navigation = CardService.newNavigation().updateCard(buildAddOn(e));// יצירת פקודת הניווט (Navigation) שתעדכן את הכרטיס הנוכחי
+  
+  var response = CardService.newActionResponseBuilder();// בניית התגובה הסופית (ActionResponse) שמאחדת את ההודעה ואת עדכון המסך
+  response.setNotification(notification);
+  response.setNavigation(navigation);
+  
+  return response.build(); // שליחת התשובה המוכנה לג'ימייל
+}
+
+/**
+ * פונקציה המציגה דף חדש עם כל רשימת הכתובות החסומות
+ */
+function showFullBlacklist() {
+  var blacklist = PropertiesService.getUserProperties().getProperty('blacklist');
+  var listDisplay = blacklist ? blacklist.replace(/,/g, "\n") : "Your blacklist is currently empty.";//שליפת הרשימה מהזיכרון. אם היא ריקה, נציג הודעה מתאימה
+  
+  var card = CardService.newCardBuilder();//  בניית הכרטיס (הדף החדש)
+  card.setHeader(CardService.newCardHeader().setTitle("Full Blacklist"));
+  
+  var section = CardService.newCardSection();
+  section.addWidget(CardService.newTextParagraph().setText(listDisplay));// הוספת רשימת המיילים כפסקה (כל מייל בשורה חדשה בזכות ה-replace)
+  section.addWidget(CardService.newTextButton().setText("⬅️ Back").setOnClickAction(CardService.newAction().setFunctionName('goBack'))); // הוספת כפתור חזרה לדף הראשי
+  
+  card.addSection(section);
+  return CardService.newNavigation().pushCard(card.build());// יצירת פקודת ניווט מסוג "Push" - פתיחת דף חדש מעל הדף הנוכחי
+}
+
+/**
+ * פונקציה פשוטה שסוגרת את הכרטיס הנוכחי ומחזירה אותנו אחורה
+ */
+function goBack() {
+  return CardService.newNavigation().popCard();
+}
